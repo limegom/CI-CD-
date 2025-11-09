@@ -1,0 +1,9 @@
+# Python venv/cache
+.venv/
+__pycache__/
+*.pyc
+# OS/IDE
+.DS_Store
+.vscode/
+# Docker
+dist/

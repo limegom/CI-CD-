@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pytest
+pytest-html
+httpx
+pytest-cov
+pydantic
+prometheus-fastapi-instrumentator
+prometheus-client
+python-logging-loki==0.3.1

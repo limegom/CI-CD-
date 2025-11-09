@@ -1,0 +1,261 @@
+# main.py (수정본)
+
+from fastapi import FastAPI, HTTPException, Query, status, Request
+from contextlib import asynccontextmanager
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, date
+import json
+import logging
+import time
+from multiprocessing import Queue
+from os import getenv
+from pathlib import Path
+from threading import Lock
+from prometheus_fastapi_instrumentator import Instrumentator
+
+NOT_FOUND_DETAIL = "To-Do 아이템을 찾을 수 없습니다"
+TODO_FILE = Path("todo.json")
+FILE_LOCK = Lock()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 앱 시작 시(필요 시 초기화 코드 위치)
+    yield
+    # 앱 종료 시: 로깅 핸들러 정리
+    for h in list(custom_logger.handlers):
+        try:
+            if hasattr(h, "flush"):
+                h.flush()
+        except Exception:
+            pass
+        try:
+            h.close()
+        except Exception:
+            pass
+        try:
+            custom_logger.removeHandler(h)
+        except Exception:
+            pass
+
+app = FastAPI(lifespan=lifespan)
+
+# Prometheus 메트릭스 엔드포인트 (/metrics) - 한 번만 등록
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+# Custom access logger (uvicorn 기본 access 로그 대신 사용)
+custom_logger = logging.getLogger("custom.access")
+custom_logger.setLevel(logging.INFO)
+
+# --- Loki 핸들러: LOKI_ENDPOINT 있을 때만 등록 ---
+LOKI_ENDPOINT = (getenv("LOKI_ENDPOINT") or "").strip()
+if LOKI_ENDPOINT:
+    try:
+        # logging_loki는 LOKI_ENDPOINT가 유효할 때만 임포트/초기화
+        from logging_loki import LokiQueueHandler  # 지연 임포트
+        loki_handler = LokiQueueHandler(
+            Queue(-1),
+            url=LOKI_ENDPOINT,
+            tags={"application": "fastapi"},
+            version="1",
+        )
+        custom_logger.addHandler(loki_handler)
+        logger.info("Loki handler enabled: %s", LOKI_ENDPOINT)
+    except Exception as e:
+        logger.warning("Loki handler init failed: %s", e)
+
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    # 액세스 로그 (테스트/운영 공통)
+    custom_logger.info(
+        '%s - "%s %s HTTP/1.1" %d %.3fs',
+        request.client.host if request.client else "-",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration,
+    )
+    return response
+
+app.middleware("http")(log_requests)
+
+
+class TodoItem(BaseModel):
+    id: int
+    title: str = Field(..., min_length=1)
+    description: Optional[str] = ""
+    completed: bool = False
+    created_at: Optional[str] = None
+    due_date: Optional[str] = None      # YYYY-MM-DD
+    days_left: Optional[int] = None
+
+def load_todos() -> List[dict]:
+    try:
+        data = TODO_FILE.read_text(encoding="utf-8")
+        return json.loads(data)
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as e:
+        logger.error("JSON 디코딩 실패: %s", e)
+        raise HTTPException(status_code=500, detail="To-Do 파일 읽기 실패")
+
+def save_todos(todos: List[dict]) -> None:
+    try:
+        with FILE_LOCK:
+            TODO_FILE.write_text(
+                json.dumps(todos, indent=4, ensure_ascii=False), encoding="utf-8"
+            )
+    except OSError as e:
+        logger.error("파일 쓰기 실패: %s", e)
+        raise HTTPException(status_code=500, detail="To-Do 파일 저장 실패")
+
+def compute_days_left(due: Optional[str]) -> Optional[int]:
+    if not due:
+        return None
+    try:
+        d = date.fromisoformat(due)
+        return (d - datetime.utcnow().date()).days
+    except ValueError:
+        return None
+
+@app.get("/todos", response_model=List[TodoItem])
+def get_todos():
+    todos = load_todos()
+    for t in todos:
+        t["days_left"] = compute_days_left(t.get("due_date"))
+    return sorted(todos, key=lambda t: t.get("completed", False))
+
+@app.post("/todos", response_model=TodoItem)
+def create_todo(item: TodoItem):
+    todos = load_todos()
+    if any(t["id"] == item.id for t in todos):
+        raise HTTPException(status_code=400, detail="이미 존재하는 ID입니다")
+    if not item.created_at:
+        item.created_at = datetime.utcnow().isoformat()
+    todos.append(item.model_dump())
+    save_todos(todos)
+    return item
+
+@app.get("/todos/search", response_model=List[TodoItem])
+def search_todos(query: str = Query(..., min_length=1)):
+    todos = load_todos()
+    q = query.lower()
+    return [t for t in todos
+            if q in t["title"].lower()
+            or (t.get("description") and q in t["description"].lower())]
+
+@app.get("/todos/{todo_id}", response_model=TodoItem)
+def get_todo_by_id(todo_id: int):
+    for t in load_todos():
+         if t["id"] == todo_id:
+            t["days_left"] = compute_days_left(t.get("due_date"))
+            return t
+    raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+
+@app.put("/todos/{todo_id}", response_model=TodoItem)
+def update_todo(todo_id: int, item: TodoItem):
+    todos = load_todos()
+    for idx, t in enumerate(todos):
+        if t["id"] == todo_id:
+            updated = item.model_dump()
+            updated["id"] = todo_id
+            updated["created_at"] = t["created_at"]
+            updated["days_left"] = compute_days_left(updated.get("due_date"))
+            todos[idx] = updated
+            save_todos(todos)
+            return updated
+    raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+
+@app.delete("/todos/{todo_id}", response_model=dict)
+def delete_todo(todo_id: int):
+    todos = load_todos()
+    remaining = [t for t in todos if t["id"] != todo_id]
+    if len(remaining) == len(todos):
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    save_todos(remaining)
+    return {"message": "To-Do 아이템이 삭제되었습니다"}
+
+@app.delete("/todos/completed", response_model=dict)
+def delete_completed_todos():
+    todos = load_todos()
+    remaining = [t for t in todos if not t.get("completed", False)]
+    deleted_count = len(todos) - len(remaining)
+    save_todos(remaining)
+    return {"message": f"완료된 To-Do 아이템 {deleted_count}개를 삭제했다"}
+
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    template = Path("templates") / "index.html"
+    try:
+        content = template.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.error("템플릿 로드 실패: %s", e)
+        raise HTTPException(status_code=500, detail="템플릿 로드 실패")
+    return HTMLResponse(content)
+
+@app.patch("/todos/{todo_id}/complete", response_model=TodoItem, status_code=status.HTTP_200_OK)
+def complete_todo(todo_id: int):
+    todos = load_todos()
+    for idx, t in enumerate(todos):
+        if t["id"] == todo_id:
+            todos[idx]["completed"] = not t.get("completed", False)
+            save_todos(todos)
+            return todos[idx]
+    raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+
+# 반복 To-Do 저장 파일
+REPEAT_FILE = Path("repeating_todos.json")
+
+class RepeatingTodo(BaseModel):
+    id: int
+    title: str = Field(..., min_length=1)
+    description: Optional[str] = ""
+    repeat_type: str = Field(..., pattern="^(daily|weekly)$")
+    repeat_days: Optional[List[int]] = []  # 0=Sun ~ 6=Sat
+
+def load_repeating() -> List[dict]:
+    try:
+        return json.loads(REPEAT_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as e:
+        logger.error("반복 항목 JSON 디코딩 실패: %s", e)
+        raise HTTPException(status_code=500, detail="반복 항목 로딩 실패")
+
+def save_repeating(items: List[dict]) -> None:
+    try:
+        with FILE_LOCK:
+            REPEAT_FILE.write_text(
+                json.dumps(items, indent=4, ensure_ascii=False), encoding="utf-8"
+            )
+    except OSError as e:
+        logger.error("반복 항목 저장 실패: %s", e)
+        raise HTTPException(status_code=500, detail="반복 항목 저장 실패")
+
+@app.get("/repeating", response_model=List[RepeatingTodo])
+def get_repeating_todos():
+    return load_repeating()
+
+@app.post("/repeating", response_model=RepeatingTodo)
+def create_repeating_todo(item: RepeatingTodo):
+    items = load_repeating()
+    if any(x["id"] == item.id for x in items):
+        raise HTTPException(status_code=400, detail="이미 존재하는 ID입니다")
+    items.append(item.model_dump())
+    save_repeating(items)
+    return item
+
+@app.delete("/repeating/{item_id}", response_model=dict)
+def delete_repeating_todo(item_id: int):
+    items = load_repeating()
+    remaining = [x for x in items if x["id"] != item_id]
+    if len(items) == len(remaining):
+        raise HTTPException(status_code=404, detail="반복 항목을 찾을 수 없습니다")
+    save_repeating(remaining)
+    return {"message": "반복 항목이 삭제되었습니다"}

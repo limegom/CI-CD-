@@ -1,0 +1,76 @@
+name: Local Deploy (Docker run)
+
+on:
+  workflow_dispatch: {}   # 수동 실행
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE_NAME: local/fastapi-todos
+      CONTAINER_NAME: fastapi-app
+      APP_PORT: "5001"              # 컨테이너/호스트 동시에 5001 사용
+      LOKI_ENDPOINT: ""             # 로컬 연습: Loki 비활성화
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: fastapi-app/Dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run container (detached)
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            -e LOKI_ENDPOINT="${LOKI_ENDPOINT}" \
+            -p ${APP_PORT}:${APP_PORT} \
+            $IMAGE_NAME:${GITHUB_SHA}
+          # 기동 대기
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:${APP_PORT}/" >/dev/null; then
+              echo "App is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "App did not become ready in time" >&2
+          docker logs "$CONTAINER_NAME" || true
+          exit 1
+
+      - name: Smoke test
+        run: |
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${APP_PORT}/todos")
+          echo "GET /todos -> $http_code"
+          test "$http_code" = "200"
+
+      - name: Show logs (for debugging)
+        if: always()
+        run: |
+          echo "---- container logs ----"
+          docker logs "$CONTAINER_NAME" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER_NAME" || true
